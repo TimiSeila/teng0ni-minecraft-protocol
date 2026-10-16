@@ -1,0 +1,585 @@
+'use strict'
+const EventEmitter = require('events').EventEmitter
+const compression = require('./transforms/compression')
+const framing = require('./transforms/framing')
+const states = require('./states')
+const debug = require('debug')('minecraft-protocol')
+const debugSkip = process.env.DEBUG_SKIP?.split(',') ?? []
+
+const createSerializer = require('./transforms/serializer').createSerializer
+const createDeserializer = require('./transforms/serializer').createDeserializer
+const createCipher = require('./transforms/encryption').createCipher
+const createDecipher = require('./transforms/encryption').createDecipher
+const [readVarInt] = require('protodef').types.varint
+
+const closeTimeout = 30 * 1000
+const replaceablePackets = new Set([
+  'flying',
+  'look',
+  'player_input',
+  'position',
+  'position_look',
+  'steer_vehicle',
+  'tick_end'
+])
+
+// Packets whose relative order is validated server-side (movement checks,
+// teleport ack/echo ordering, 26.1+ tick cadence). A priority write must never
+// overtake these: on laggy links the priority queue (attack / arm_animation /
+// keep_alive) would otherwise be flushed before movement packets that were
+// queued earlier, making the server process an attack / keepalive against a
+// stale position and tripping anti-cheat checks.
+const orderingSensitivePackets = new Set([
+  'teleport_confirm',
+  'flying',
+  'look',
+  'position',
+  'position_look',
+  'player_input',
+  'tick_end'
+])
+
+class Client extends EventEmitter {
+  constructor (isServer, version, customPackets, hideErrors = false) {
+    super()
+    this.customPackets = customPackets
+    this.version = version
+    this.isServer = !!isServer
+    this.splitter = framing.createSplitter()
+    this.packetsToParse = {}
+    this.compressor = null
+    this.framer = framing.createFramer()
+    this.cipher = null
+    this.decipher = null
+    this.decompressor = null
+    this.ended = true
+    this.latency = 0
+    this.hideErrors = hideErrors
+    this.closeTimer = null
+    this._writeQueue = []
+    this._priorityWriteQueue = []
+    this._drainingWrites = false
+    this._socketEventHistory = []
+    this._socketActivityCount = 0
+    this._ending = false
+    this._mcBundle = []
+    const mcData = require('minecraft-data')(version)
+    this._supportFeature = mcData.supportFeature
+    this.protocolVersion = mcData.version.version
+    this.state = states.HANDSHAKING
+    this._hasBundlePacket = mcData.supportFeature('hasBundlePacket')
+  }
+
+  get state () {
+    return this.protocolState
+  }
+
+  // Upstream of the deserializer: the decompressor once compression is
+  // negotiated, the splitter before that. Both error-recovery and normal
+  // (re)wiring need to agree on this, so derive it in one place.
+  get _deserializerSource () {
+    return this.compressor ? this.decompressor : this.splitter
+  }
+
+  // A hard (non-PartialReadError) parse failure makes protodef call the
+  // Transform callback with an error, which DESTROYS the deserializer.
+  // A destroyed stream can never accept data again, so simply re-piping the
+  // upstream into it silently drops every subsequent packet: inbound traffic
+  // stops being parsed, keep_alive is never answered, backpressure cascades to
+  // the socket, and the connection freezes with no error, no close and no EOF
+  // until the keepalive watchdog fires ~2 minutes later.
+  //
+  // Recover by building a fresh parser for the current state and rewiring the
+  // upstream to it.
+  _rebuildDeserializer () {
+    const source = this._deserializerSource
+    const old = this.deserializer
+
+    if (old) {
+      source.unpipe(old)
+      old.removeAllListeners()
+      // The corpse may still hold buffered chunks; make sure it cannot keep
+      // the process alive or emit late events.
+      if (typeof old.destroy === 'function' && !old.destroyed) old.destroy()
+    }
+
+    this._attachDeserializer(this.protocolState)
+    // A packet failed mid-stream; any partially collected bundle is now
+    // untrustworthy.
+    this._mcBundle = []
+    source.pipe(this.deserializer)
+  }
+
+  setSerializer (state) {
+    this.serializer = createSerializer({ isServer: this.isServer, version: this.version, state, customPackets: this.customPackets })
+    this._mcBundle = []
+    this._attachDeserializer(state)
+
+    // Build name-to-id reverse mappings for Configuration and Play debug logging
+    this._packetNameToIdIn = null
+    this._packetNameToIdOut = null
+    if (debug.enabled && (state === states.CONFIGURATION || state === states.PLAY)) {
+      try {
+        const mcData = require('minecraft-data')(this.version)
+        if (mcData && mcData.protocol) {
+          const section = state === states.CONFIGURATION ? mcData.protocol.configuration : mcData.protocol.play
+          if (section) {
+            const inDir = this.isServer ? 'toServer' : 'toClient'
+            const outDir = !this.isServer ? 'toServer' : 'toClient'
+            const inPacket = section[inDir]?.types?.packet
+            const outPacket = section[outDir]?.types?.packet
+            if (inPacket) {
+              const mappings = inPacket[1]?.[0]?.type?.[1]?.mappings
+              if (mappings) {
+                this._packetNameToIdIn = {}
+                for (const [id, name] of Object.entries(mappings)) {
+                  this._packetNameToIdIn[name] = id
+                }
+              }
+            }
+            if (outPacket) {
+              const mappings = outPacket[1]?.[0]?.type?.[1]?.mappings
+              if (mappings) {
+                this._packetNameToIdOut = {}
+                for (const [id, name] of Object.entries(mappings)) {
+                  this._packetNameToIdOut[name] = id
+                }
+              }
+            }
+          }
+        }
+      } catch (e) { /* ignore errors in debug path */ }
+    }
+
+    this.splitter.recognizeLegacyPing = state === states.HANDSHAKING
+
+    this.serializer.on('error', (e) => {
+      let parts
+      if (e.field) {
+        parts = e.field.split('.')
+        parts.shift()
+      } else { parts = [] }
+      const serializerDirection = !this.isServer ? 'toServer' : 'toClient'
+      e.field = [this.protocolState, serializerDirection].concat(parts).join('.')
+      e.message = `Serialization error for ${e.field} : ${e.message}`
+      if (!this.compressor) { this.serializer.pipe(this.framer) } else { this.serializer.pipe(this.compressor) }
+      this.emit('error', e)
+    })
+    this.serializer.on('drain', () => this._drainWriteQueue())
+  }
+
+  // Creates the inbound parser for `state` and wires its handlers. Split out of
+  // setSerializer so a destroyed parser can be replaced after a hard parse
+  // error without disturbing the outbound serializer (which owns the write
+  // queue and the framer pipe).
+  _attachDeserializer (state) {
+    this.deserializer = createDeserializer({
+      isServer: this.isServer,
+      version: this.version,
+      state,
+      packetsToParse:
+      this.packetsToParse,
+      customPackets: this.customPackets,
+      noErrorLogging: this.hideErrors
+    })
+
+    this.deserializer.on('error', (e) => {
+      let parts = []
+      if (e.field) {
+        parts = e.field.split('.')
+        parts.shift()
+      }
+      const deserializerDirection = this.isServer ? 'toServer' : 'toClient'
+      e.field = [this.protocolState, deserializerDirection].concat(parts).join('.')
+
+      // For protocols 775/776 (26.1/26.2), an unmapped packet ID is safe to expose as a
+      // raw packet: no payload schema exists to decode. A malformed known packet
+      // must remain an error rather than being skipped, otherwise the client
+      // silently desynchronizes from the server.
+      const isUnknownPacket = e.message && e.message.includes('is not in the mappings value')
+      if (e.buffer) {
+        let packetId
+        try {
+          const result = readVarInt(e.buffer, 0)
+          packetId = result.value
+          e.packetId = packetId
+        } catch (_) {
+          packetId = undefined
+        }
+        // Keep the exact framed payload available for a schema fix. It is not
+        // the preceding successfully decoded packet.
+        e.packetBuffer = e.buffer
+        e.packetHex = e.buffer.toString('hex')
+        if (process.env.MINECRAFT_PROTOCOL_ERROR_DUMP) {
+          require('fs').writeFileSync(process.env.MINECRAFT_PROTOCOL_ERROR_DUMP, e.buffer)
+        }
+      }
+      // An unmapped packet ID is safe to expose as a raw packet: there is no
+      // payload schema to decode, so nothing can be desynchronized by skipping
+      // it. A malformed KNOWN packet is different -- it means our schema and the
+      // server disagree, which must surface as an error.
+      //
+      // teams (0x6d) used to be special-cased here as "known to be malformed on
+      // 26.1/26.2". That was wrong. The 26.1 and 26.2 packet_teams schemas were
+      // both verified field-by-field against the decompiled
+      // ClientboundSetPlayerTeamPacket.Parameters and are correct; they merely
+      // order their fields differently between the two versions. Parsing a
+      // frame with the wrong version's schema does not raise an error at all --
+      // it silently decodes garbage and under-consumes the buffer. So a real
+      // 0x6d parse error is a genuine signal and swallowing it only hid
+      // problems. See test/protocol_26_2.test.js for the field-order pins.
+      if (this.protocolVersion >= 775 && isUnknownPacket && e.buffer) {
+        this.emit('rawPacket', {
+          buffer: e.buffer,
+          state: this.protocolState,
+          protocolVersion: this.protocolVersion,
+          packetId: e.packetId
+        })
+        // protodef destroyed this parser when it reported the error. Replace it
+        // so the next packet can still be consumed.
+        this._rebuildDeserializer()
+        return
+      }
+
+      // Always include the packet context. When the FullPacketParser did not
+      // attach the framed payload (e.g. errors raised inside raw-protocol
+      // native types), report the protocol state + direction so the failing
+      // packet can still be correlated with wire dumps.
+      const packetInfo = e.buffer
+        ? `(packet 0x${e.packetId?.toString(16) ?? 'unknown'}, ${e.buffer.length} bytes, ${e.buffer.toString('hex').slice(0, 6)}...)`
+        : `(protocol ${this.protocolVersion}, no framed payload attached)`
+      e.message = `Parse error for ${e.field} ${packetInfo} : ${e.message}`
+      this._rebuildDeserializer()
+      this.emit('error', e)
+    })
+    const emitPacket = (parsed) => {
+      this.emit('packet', parsed.data, parsed.metadata, parsed.buffer, parsed.fullBuffer)
+      this.emit(parsed.metadata.name, parsed.data, parsed.metadata)
+      this.emit('raw.' + parsed.metadata.name, parsed.buffer, parsed.metadata)
+      this.emit('raw', parsed.buffer, parsed.metadata)
+    }
+    // Wraps emitPacket so that a throwing listener cannot abort processing of
+    // the remaining packets in the same bundle or batch. Errors are printed to
+    // stderr (unless hideErrors is set) but do NOT disconnect the bot.
+    const safeEmitPacket = (parsed) => {
+      try {
+        emitPacket(parsed)
+      } catch (err) {
+        if (!this.hideErrors) {
+          // eslint-disable-next-line no-console
+          console.error('[minecraft-protocol] uncaught error in listener for packet', parsed.metadata?.name, err)
+        }
+      }
+    }
+    this.deserializer.on('data', (parsed) => {
+      parsed.metadata.name = parsed.data.name
+      parsed.data = parsed.data.params
+      parsed.metadata.state = state
+
+      // For protocols 775/776 (26.1/26.2): when an inbound VarInt id is not in the current
+      // state's packet table (name is numeric, params is undefined), emit 'rawPacket'
+      // instead of normal packet events. Do NOT throw 'error', do NOT disconnect socket.
+      // The read loop continues consuming subsequent packets normally.
+      if (this.protocolVersion >= 775 && typeof parsed.metadata.name === 'number' && parsed.data === undefined) {
+        this.emit('rawPacket', {
+          buffer: parsed.fullBuffer || parsed.buffer,
+          state: this.protocolState,
+          protocolVersion: this.protocolVersion,
+          packetId: parsed.metadata.name
+        })
+        return
+      }
+
+      if (debug.enabled && !debugSkip.includes(parsed.metadata.name)) {
+        const id = this._packetNameToIdIn?.[parsed.metadata.name]
+        const idStr = id ? ` (${id})` : ''
+        debug('read packet ' + state + '.' + parsed.metadata.name + idStr)
+        const s = JSON.stringify(parsed.data, null, 2)
+        debug(s && s.length > 10000 ? parsed.data : s)
+      }
+      if (this._hasBundlePacket && parsed.metadata.name === 'bundle_delimiter') {
+        if (this._mcBundle.length) { // End bundle
+          // Clear _mcBundle before emitting so re-entrant packet processing
+          // (e.g. a listener that triggers another emit) cannot corrupt the list.
+          const bundle = this._mcBundle
+          this._mcBundle = []
+          bundle.forEach(safeEmitPacket)
+          emitPacket(parsed)
+        } else { // Start bundle
+          this._mcBundle.push(parsed)
+        }
+      } else if (this._mcBundle.length) {
+        this._mcBundle.push(parsed)
+        // Safety valve: if a bundle grows unexpectedly large (server bug or
+        // version mismatch), flush and reset. Do NOT set _hasBundlePacket=false
+        // — the server is still sending bundles and we must keep honouring them.
+        if (this._mcBundle.length > 1024) {
+          const oversized = this._mcBundle
+          this._mcBundle = []
+          oversized.forEach(safeEmitPacket)
+        }
+      } else {
+        emitPacket(parsed)
+      }
+    })
+  }
+
+  set state (newProperty) {
+    const oldProperty = this.protocolState
+    this.protocolState = newProperty
+
+    if (oldProperty && oldProperty !== newProperty) {
+      // Packets queued for the old backend/state cannot be sent after a
+      // Velocity server switch. In particular, a queued movement packet would
+      // otherwise be serialized before configuration_acknowledged and stall
+      // the new backend's configuration handshake.
+      this._writeQueue.length = 0
+      this._priorityWriteQueue.length = 0
+      this._mcBundle = []
+    }
+
+    if (this.serializer) {
+      if (!this.compressor) {
+        this.serializer.unpipe()
+      } else {
+        this.serializer.unpipe(this.compressor)
+      }
+      this._deserializerSource.unpipe(this.deserializer)
+
+      this.serializer.removeAllListeners()
+      this.deserializer.removeAllListeners()
+    }
+    this.setSerializer(this.protocolState)
+
+    if (!this.compressor) {
+      this.serializer.pipe(this.framer)
+    } else {
+      this.serializer.pipe(this.compressor)
+      if (globalThis.debugNMP) this.decompressor.on('data', (data) => { console.log('DES>', data.toString('hex')) })
+    }
+    this._deserializerSource.pipe(this.deserializer)
+
+    this.emit('state', newProperty, oldProperty)
+  }
+
+  get compressionThreshold () {
+    return this.compressor == null ? -2 : this.compressor.compressionThreshold
+  }
+
+  set compressionThreshold (threshold) {
+    this.setCompressionThreshold(threshold)
+  }
+
+  setSocket (socket) {
+    this.ended = false
+    this._ending = false
+    this._lastSocketActivity = Date.now()
+    this._lastSocketDataAt = null
+    this._lastSocketEvent = null
+    this._socketActivityCount = 0
+    this._socketEventHistory = []
+
+    const recordSocketEvent = (event, details = {}) => {
+      const record = { event, at: Date.now(), ...details }
+      this._lastSocketEvent = record
+      this._socketEventHistory.push(record)
+      if (this._socketEventHistory.length > 8) this._socketEventHistory.shift()
+    }
+
+    // TODO : A lot of other things needs to be done.
+    const endSocket = (event, record = true) => {
+      if (this.ended) return
+      if (record) recordSocketEvent(event)
+      this.ended = true
+      // Clear pending write queues so that a socket drain event firing after
+      // the connection is closed cannot attempt to write to a reset socket
+      // (which would produce a spurious "write ECONNRESET" error).
+      this._writeQueue = []
+      this._priorityWriteQueue = []
+      clearTimeout(this.closeTimer)
+      this.socket.removeListener('close', onClose)
+      this.socket.removeListener('end', onEnd)
+      this.socket.removeListener('timeout', onTimeout)
+      this.emit('end', this._endReason || 'socketClosed')
+    }
+
+    const onFatalError = (err) => {
+      recordSocketEvent('error', {
+        code: err.code,
+        message: err.message
+      })
+      // Once we've already decided to end this connection (keepalive
+      // timeout, a Velocity switch that never completed, or a normal
+      // bot.end()/quit()), a socket error surfacing during teardown (e.g.
+      // EPIPE from writing a FIN to an already-blackholed connection) is
+      // expected noise, not a new problem. Emitting it as a second top-level
+      // 'error' event produces a confusing, context-free message right after
+      // the real error/reason has already been reported. Still record it for
+      // diagnostics, but don't re-alarm consumers; endSocket() below still
+      // fires 'end' with the original reason.
+      if (this._ending) {
+        this._teardownError = { code: err.code, message: err.message, at: Date.now() }
+        endSocket('error', false)
+        return
+      }
+      this.emit('error', err)
+      endSocket('error', false)
+    }
+
+    const onError = (err) => this.emit('error', err)
+    const onSocketData = (data) => {
+      // Record activity before packet parsing, which can be delayed by a large batch.
+      this._lastSocketActivity = Date.now()
+      this._lastSocketDataAt = this._lastSocketActivity
+      this._socketActivityCount++
+      recordSocketEvent('data', { bytes: data.length })
+      this.emit('socketActivity')
+    }
+    const onConnect = () => {
+      recordSocketEvent('connect')
+      this.emit('connect')
+    }
+    const onClose = () => endSocket('close')
+    const onEnd = () => endSocket('end')
+    const onTimeout = () => endSocket('timeout')
+
+    this.socket = socket
+
+    if (this.socket.setNoDelay) { this.socket.setNoDelay(true) }
+
+    this.socket.on('connect', onConnect)
+
+    this.socket.on('error', onFatalError)
+    this.socket.on('close', onClose)
+    this.socket.on('end', onEnd)
+    this.socket.on('timeout', onTimeout)
+    this.socket.on('data', onSocketData)
+    this.socket.on('drain', () => this._drainWriteQueue())
+    this.framer.on('error', onError)
+    this.splitter.on('error', onError)
+
+    this.socket.pipe(this.splitter)
+    this.framer.pipe(this.socket)
+  }
+
+  end (reason) {
+    this._endReason = reason
+    this._ending = true
+    this._writeQueue = []
+    this._priorityWriteQueue = []
+    /* ending the serializer will end the whole chain
+    serializer -> framer -> socket -> splitter -> deserializer */
+    if (this.serializer) {
+      this.serializer.end()
+    } else {
+      if (this.socket) this.socket.end()
+    }
+    if (this.socket) {
+      this.closeTimer = setTimeout(
+        this.socket.destroy.bind(this.socket),
+        closeTimeout
+      )
+    }
+  }
+
+  setEncryption (sharedSecret) {
+    if (this.cipher != null) { this.emit('error', new Error('Set encryption twice!')) }
+    this.cipher = createCipher(sharedSecret)
+    this.cipher.on('error', (err) => this.emit('error', err))
+    this.framer.unpipe(this.socket)
+    this.framer.pipe(this.cipher).pipe(this.socket)
+    this.decipher = createDecipher(sharedSecret)
+    this.decipher.on('error', (err) => this.emit('error', err))
+    this.socket.unpipe(this.splitter)
+    this.socket.pipe(this.decipher).pipe(this.splitter)
+  }
+
+  setCompressionThreshold (threshold) {
+    if (this.compressor == null) {
+      this.compressor = compression.createCompressor(threshold)
+      this.compressor.on('error', (err) => this.emit('error', err))
+      this.serializer.unpipe(this.framer)
+      this.serializer.pipe(this.compressor).pipe(this.framer)
+      this.decompressor = compression.createDecompressor(threshold, this.hideErrors)
+      this.decompressor.on('error', (err) => this.emit('error', err))
+      this.splitter.unpipe(this.deserializer)
+      this.splitter.pipe(this.decompressor).pipe(this.deserializer)
+    } else {
+      this.decompressor.threshold = threshold
+      this.compressor.threshold = threshold
+    }
+  }
+
+  write (name, params) {
+    this._queueWrite(name, params, false)
+  }
+
+  writePriority (name, params) {
+    this._queueWrite(name, params, true)
+  }
+
+  _queueWrite (name, params, priority) {
+    if (!this.serializer?.writable) return
+    if (debug.enabled && !debugSkip.includes(name)) {
+      const id = this._packetNameToIdOut?.[name]
+      const idStr = id ? ` (${id})` : ''
+      debug('writing packet ' + this.state + '.' + name + idStr)
+      debug(params)
+    }
+
+    const queue = priority ? this._priorityWriteQueue : this._writeQueue
+    if (!priority && replaceablePackets.has(name)) {
+      for (let index = queue.length - 1; index >= 0; index--) {
+        if (queue[index].name === name) {
+          queue[index] = { name, params }
+          this._drainWriteQueue()
+          return
+        }
+      }
+    }
+    queue.push({ name, params })
+    this._drainWriteQueue()
+  }
+
+  _drainWriteQueue () {
+    if (this._drainingWrites || this.ended || !this.serializer?.writable) return
+    this._drainingWrites = true
+
+    while (this._writeQueue.length || this._priorityWriteQueue.length) {
+      if (this.socket?.writableNeedDrain || this.framer.readableLength >= this.framer.readableHighWaterMark) break
+      // Ordering-sensitive packets queued earlier always go out first, even
+      // when a priority packet is waiting: they must reach the server in the
+      // order the caller produced them (e.g. teleport_confirm before the
+      // echoed position_look, movement before tick_end).
+      const packet = (this._writeQueue.length && orderingSensitivePackets.has(this._writeQueue[0].name))
+        ? this._writeQueue.shift()
+        : (this._priorityWriteQueue.shift() || this._writeQueue.shift())
+      if (packet.name === 'keep_alive') this._lastKeepAliveWriteAt = Date.now()
+      if (!this.serializer.write(packet)) break
+    }
+
+    this._drainingWrites = false
+  }
+
+  writeBundle (packets) {
+    if (this._hasBundlePacket) this.write('bundle_delimiter', {})
+    for (const [name, params] of packets) this.write(name, params)
+    if (this._hasBundlePacket) this.write('bundle_delimiter', {})
+  }
+
+  writeRaw (buffer) {
+    const stream = this.compressor === null ? this.framer : this.compressor
+    if (!stream.writable) { return }
+    stream.write(buffer)
+  }
+
+  // TCP/IP-specific (not generic Stream) method for backwards-compatibility
+  connect (port, host) {
+    const options = { port, host }
+    if (!this.options) this.options = options
+    require('./client/tcp_dns')(this, options)
+    options.connect(this)
+  }
+}
+
+module.exports = Client
